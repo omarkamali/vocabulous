@@ -17,13 +17,13 @@ logging.basicConfig(
 
 try:
     nltk.data.find("tokenizers/punkt")
-except nltk.downloader.DownloadError:
+except LookupError:
     logging.info("Downloading nltk punkt tokenizer...")
     nltk.download("punkt")
 
 try:
     nltk.data.find("tokenizers/punkt_tab")
-except nltk.downloader.DownloadError:
+except LookupError:
     logging.info("Downloading nltk punkt_tab tokenizer...")
     nltk.download("punkt_tab")
 
