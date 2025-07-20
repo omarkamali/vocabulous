@@ -41,7 +41,7 @@ dependencies = [
     "nltk>=3.6",
     "swifter>=1.0.0",
     "tqdm>=4.60.0",
-    "unscript>=2.1.0",
+    "unscript>=0.0.1",
 ]
 
 [project.optional-dependencies]
