@@ -25,6 +25,6 @@ jobs:
     - name: Install uv
       run: curl -LsSf https://astral.sh/uv/install.sh | sh
     - name: Install project dependencies
-      run: uv pip install -e ".[dev]"
+      run: uv pip install --system -e ".[dev]"
     - name: Run tests
       run: timeout 60 uv pytest -v --tb=short 
