@@ -24,7 +24,7 @@ Vocabulous addresses a common challenge in NLP: building reliable language detec
 ## Installation
 
 ```bash
-pip install vocabulous
+uv pip install vocabulous
 ```
 
 ### Development Installation
@@ -32,7 +32,7 @@ pip install vocabulous
 ```bash
 git clone https://github.com/omarkamali/vocabulous.git
 cd vocabulous
-pip install -e .
+uv pip install -e ".[dev]"
 ```
 
 ## Quick Start
@@ -207,6 +207,32 @@ for i, cycle_report in enumerate(report['cycle_reports']):
     print(f"  Confidence Margin: {cycle_report['confidence_margin']:.3f}")
 ```
 
+### Scoring backends
+
+- **Default**: swifter-accelerated Pandas apply via `model._score(...)`.
+- **Alternatives (experimental)**: `vectorized`, `numba`, `sparse` backends exist and are used in benchmarks.
+
+Planned API to switch backends:
+
+```python
+model.set_scoring_mode("vectorized")  # or: "apply", "numba", "sparse", "auto"
+scored = model._score(df)
+```
+
+Until switching is wired end-to-end, call experimental methods directly:
+
+```python
+# Vectorized scoring for a text Series -> Series[dict]
+scores_vec = model._score_vectorized(df["text"])  # experimental API
+df = df.copy()
+df["scores"] = scores_vec
+
+# Numba-backed scoring (if numba installed) -> Series[dict]
+scores_numba = model._score_numba(df["text"])  # experimental API
+
+# Note: _score(...) remains the default swifter-apply path as of 0.1.2
+```
+
 ### Confidence Scoring
 
 ```python
@@ -249,6 +275,25 @@ model, _ = model.train(data, eval_data, base_confidence=0.7)
 ```
 
 ## Evaluation Metrics
+ 
+## Benchmarks
+
+- **Full results**: See [benchmark.md](./benchmarks/benchmark.md) for the complete output and methodology.
+- **Highlights**:
+  - 20k rows clean+score: ~454k rows/s
+  - Apply vs Vectorized: ~450–500k rows/s on 5k–50k rows
+  - Longer sentences reduce throughput (len=50 ~190k rows/s)
+  - Dictionary size (50→5000 per language): near ~450–480k rows/s
+  - Large-n vectorized batched (100k): ~403k rows/s
+  - Large-n compare (200k, dict=1000, len=20): ~224k–225k rows/s across modes
+
+Run locally with uv:
+
+```bash
+uv run python benchmarks/benchmark_vocabulous.py | tee benchmarks/benchmark_output.txt
+```
+
+## Classification Performance
 
 Vocabulous provides comprehensive evaluation metrics:
 
@@ -325,6 +370,10 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Acknowledgments
 
 This project is supported by Omneity Labs, a research lab focused on building NLP and generative AI models for low-resource languages and techniques for cultural alignment.
+
+## Contributors
+
+[Omar Kamali](https://omarkama.li)
 
 ## Citation
 

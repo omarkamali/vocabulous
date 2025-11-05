@@ -124,6 +124,54 @@ class TestScoringFunctionality:
         assert scores == {}
 
 
+class TestVectorizedEquivalence:
+    """Ensure vectorized scoring matches per-row scoring results."""
+
+    def setup_method(self):
+        self.model = Vocabulous()
+        self.model.word_lang_freq = {
+            "hello": {"en": 5, "de": 1},
+            "world": {"en": 4},
+            "bonjour": {"fr": 5},
+            "monde": {"fr": 3},
+            "hallo": {"de": 6},
+            "welt": {"de": 4},
+        }
+        self.model.languages = {"en", "fr", "de"}
+
+    def test_vectorized_scores_match_row_apply(self):
+        df = pd.DataFrame(
+            [
+                {"text": "hello world", "lang": "en"},
+                {"text": "bonjour monde", "lang": "fr"},
+                {"text": "hallo welt", "lang": "de"},
+                {"text": "hello bonjour", "lang": "en"},
+                {"text": "unknown tokens here", "lang": "en"},
+                {"text": "", "lang": "en"},
+            ]
+        )
+
+        # Clean through model to emulate pipeline
+        df["text"] = df["text"].apply(self.model._clean_text)
+        vec_scores = self.model._score_vectorized(df["text"]).tolist()
+        row_scores = df["text"].apply(self.model._score_sentence).tolist()
+        assert vec_scores == row_scores
+
+    def test_score_dataframe_vectorized_path(self):
+        df = pd.DataFrame(
+            [
+                {"text": "Hello world", "lang": "en"},
+                {"text": "Bonjour monde", "lang": "fr"},
+                {"text": "Hallo Welt", "lang": "de"},
+            ]
+        )
+        scored = self.model._score(df)
+        # Should have precomputed top fields and scores dicts
+        assert "scores" in scored.columns
+        assert "top_lang" in scored.columns
+        assert "top_score" in scored.columns
+
+
 class TestTrainingData:
     """Test training data processing."""
 
@@ -364,3 +412,158 @@ class TestEdgeCases:
 
 if __name__ == "__main__":
     pytest.main([__file__])
+
+
+class TestSentenceExpansion:
+    """Test expansion to sentence level using vectorized explode path."""
+
+    def setup_method(self):
+        self.model = Vocabulous()
+
+    def test_expand_to_sentence_level(self):
+        df = pd.DataFrame(
+            [
+                {"text": "Hello world. How are you?", "lang": "en"},
+                {"text": "Bonjour le monde! Ça va bien.", "lang": "fr"},
+            ]
+        )
+        expanded = self.model._expand_to_sentence_level(df, text_column="text", lang_column="lang")
+
+        # Expect at least 2 sentences from first row and 2 from second (NLTK splits on . ? !)
+        assert len(expanded) >= 4
+        # Ensure each expanded row retains language and has non-empty sentence
+        assert expanded["lang"].isin(["en", "fr"]).all()
+        assert (expanded["text"].str.len() > 0).all()
+
+
+class TestTokenizationBehavior:
+    """Test tokenization behavior for punctuation and unicode words."""
+
+    def setup_method(self):
+        self.model = Vocabulous()
+        self.model.word_lang_freq = {
+            "hello": {"en": 5},
+            "world": {"en": 4},
+            "مرحبا": {"ar": 3},
+        }
+        self.model.languages = {"en", "ar"}
+
+    def test_score_sentence_ignores_punctuation(self):
+        scores_plain = self.model._score_sentence("hello world")
+        scores_punct = self.model._score_sentence("hello, world!!!")
+        assert scores_plain == scores_punct
+
+    def test_score_sentence_unicode_tokens(self):
+        scores = self.model._score_sentence("مرحبا world")
+        assert "ar" in scores
+        assert "en" in scores
+        # 2 tokens, both known: expect 0.5 for each
+        assert scores["ar"] == 0.5
+        assert scores["en"] == 0.5
+
+
+class TestScoreAlreadyClean:
+    """Test the ability to skip cleaning inside _score when input is pre-cleaned."""
+
+    def setup_method(self):
+        self.model = Vocabulous()
+        self.model.word_lang_freq = {
+            "hello": {"en": 10},
+            "world": {"en": 8},
+        }
+        self.model.languages = {"en"}
+
+    def test_score_dataframe_already_clean_matches(self):
+        raw_df = pd.DataFrame([
+            {"text": "Hello, world!!!", "lang": "en"},
+            {"text": "hello world", "lang": "en"},
+        ])
+
+        # Clean the text externally as train() would
+        cleaned_df = raw_df.copy()
+        cleaned_df["text"] = cleaned_df["text"].apply(lambda t: self.model._clean_text(t))
+
+        # Score with cleaning inside _score
+        scored_with_clean = self.model._score(raw_df.copy())
+        # Score without cleaning as input is already cleaned
+        scored_already_clean = self.model._score(cleaned_df.copy(), already_clean=True)
+
+        # The scores should match row-wise
+        assert scored_with_clean["scores"].tolist() == scored_already_clean["scores"].tolist()
+
+
+class TestCleanLRUBehavior:
+    """Exercise cleaning with many duplicates to ensure deterministic outputs at scale.
+    This indirectly validates the viability of caching without relying on mocks.
+    """
+
+    def setup_method(self):
+        self.model = Vocabulous()
+
+    def test_clean_text_idempotent_many_duplicates(self):
+        base = "Hello, world!!!"
+        df = pd.DataFrame({"text": [base] * 5000 + ["  \t  "] * 100 + ["12345"] * 100})
+        cleaned = df["text"].apply(lambda t: self.model._clean_text(t))
+        # All 'Hello, world!!!' should normalize to 'hello world'
+        assert (cleaned.iloc[:5000] == "hello world").all()
+        # Whitespace-only should become empty
+        assert (cleaned.iloc[5000:5100] == "").all()
+        # Numbers-only should become empty
+        assert (cleaned.iloc[5100:] == "").all()
+
+
+class TestConfusionAndTop2:
+    """Tests for confusion calculation and precomputed top-2 usage in cleaning."""
+
+    def setup_method(self):
+        self.model = Vocabulous()
+        self.model.languages = {"en", "fr"}
+
+    def test_calculate_confusion_pair(self):
+        # Create a small scored df with true and predicted
+        df = pd.DataFrame(
+            {
+                "lang": ["en", "en", "fr", "fr", "en"],
+                "predicted_lang": ["en", "fr", "fr", "en", "fr"],
+            }
+        )
+        # For pair (en, fr): relevant rows = all (since only en/fr present)
+        # Confusions are en->fr and fr->en: here 3/5 (rows 2,3,4 0-based indexing)
+        confusion = self.model._calculate_confusion(df, "en", "fr")
+        assert pytest.approx(confusion, rel=1e-9) == 3 / 5
+
+    def test_cycle_clean_uses_precomputed_top2(self):
+        # Construct a df with precomputed top/second scores
+        df = pd.DataFrame(
+            [
+                {"text": "hello world", "lang": "en", "scores": {"en": 1.0}},
+                {
+                    "text": "bonjour monde",
+                    "lang": "fr",
+                    "scores": {"fr": 0.6, "en": 0.55},
+                },
+                {
+                    "text": "hello bonjour",
+                    "lang": "en",
+                    "scores": {"en": 0.51, "fr": 0.5},
+                },
+            ]
+        )
+        # Precompute
+        def get_top_2(scores):
+            sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+            if len(sorted_scores) == 0:
+                return None, None
+            elif len(sorted_scores) == 1:
+                return sorted_scores[0][1], 0.0
+            else:
+                return sorted_scores[0][1], sorted_scores[1][1]
+
+        df["top_score"], df["second_score"] = zip(*df["scores"].apply(get_top_2))
+
+        cleaned = self.model._cycle_clean(df, base_confidence=0.5, confidence_margin=0.05)
+        # First row should pass (1.0 >= 0.5 and matches en; infinite margin or 1.0-0)
+        # Second row should fail (fr top but margin 0.6-0.55=0.05 equals threshold? strict > used)
+        # Third row: passes base_confidence and margin 0.01, but matches en (top) — margin < 0.05 so filtered out
+        assert len(cleaned) == 1
+        assert cleaned.iloc[0]["text"] == "hello world"
