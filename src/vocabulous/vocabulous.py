@@ -9,6 +9,7 @@ import logging
 import numpy as np
 import pandas as pd
 import hashlib
+import multiprocessing as mp
 from functools import lru_cache
 from unscript import (
     get_dominant_script,
@@ -82,6 +83,35 @@ def _clean_text_cached(default_script, text):
 
     logging.debug(f"_clean_text_cached: Final cleaned length: {len(cleaned)}")
     return cleaned
+
+
+def _split_indices(length, parts):
+    """Return ordered list of index batches covering range(length)."""
+    if length == 0:
+        return []
+    if not parts or parts <= 0:
+        return [np.arange(length)]
+    parts = int(min(parts, length)) or 1
+    return [arr for arr in np.array_split(np.arange(length), parts) if len(arr)]
+
+
+def _clean_texts_chunk(payload):
+    """Worker chunk for cleaning text values."""
+    positions, values, default_script = payload
+    cleaned = [_clean_text_cached(default_script, value) for value in values]
+    return positions, cleaned
+
+
+def _sentence_record(lang, text):
+    norm_text = "" if pd.isna(text) else str(text)
+    tokens = re.findall(r"\w+", norm_text, flags=re.UNICODE)
+    return {"lang": lang, "words": set(tokens)}
+
+
+def _process_sentence_chunk(payload):
+    """Worker chunk for extracting lang/word sets."""
+    langs, texts = payload
+    return [_sentence_record(lang, text) for lang, text in zip(langs, texts)]
 
 
 class Vocabulous:
@@ -182,6 +212,8 @@ class Vocabulous:
         confidence_margin=0.5,
         text_column="text",
         lang_column="lang",
+        clean_workers=None,
+        token_workers=None,
     ):
         """Build language dictionaries from training data.
 
@@ -191,6 +223,8 @@ class Vocabulous:
             cycles (int): Number of dictionary refinement cycles
             base_confidence (float): Minimum confidence threshold for word-language associations
             confidence_margin (float): Minimum margin between top two language scores (0-1)
+            clean_workers (Optional[int]): Processes for cleaning text. Default sequential.
+            token_workers (Optional[int]): Processes for tokenizing sentences. Default sequential.
 
         Returns:
             Tuple[Vocabulous, Dict]: Updated model and training report
@@ -250,12 +284,12 @@ class Vocabulous:
 
         # Clean text before training
         logging.info("Cleaning text in training data...")
-        train_df[text_column] = train_df[text_column].swifter.apply(
-            lambda x: self._clean_text(x)
+        train_df[text_column] = self._clean_series(
+            train_df[text_column], workers=clean_workers
         )
         logging.info("Cleaning text in evaluation data...")
-        eval_df[text_column] = eval_df[text_column].swifter.apply(
-            lambda x: self._clean_text(x)
+        eval_df[text_column] = self._clean_series(
+            eval_df[text_column], workers=clean_workers
         )
 
         # Remove empty strings after cleaning
@@ -275,7 +309,11 @@ class Vocabulous:
             # Only clean data until n-1 cycle
             if cycle < cycles - 1:
                 train_df, report = self._train_cycle(
-                    train_df, eval_df, base_confidence, confidence_margin
+                    train_df,
+                    eval_df,
+                    base_confidence,
+                    confidence_margin,
+                    token_workers=token_workers,
                 )
             else:
                 # Skip cleaning on final cycle
@@ -285,6 +323,7 @@ class Vocabulous:
                     base_confidence,
                     confidence_margin,
                     skip_cleaning=True,
+                    token_workers=token_workers,
                 )
 
             cycle_reports.append(report)
@@ -324,6 +363,7 @@ class Vocabulous:
         base_confidence=0.5,
         confidence_margin=0.5,
         skip_cleaning=False,
+        token_workers=None,
     ):
         # first let's deduplicate the training data at sentence level
         logging.info(f"Deduplicating training sentences for current cycle...")
@@ -337,20 +377,9 @@ class Vocabulous:
         self.word_lang_freq = {}
         self.languages = set()
 
-        # Process sentences using swifter but in a way that avoids race conditions
-        def process_sentence(row):
-            lang = row["lang"]
-            # Use fast Unicode-aware regex tokenization and unique words per sentence
-            tokens = re.findall(r"\w+", row["text"], flags=re.UNICODE)
-            words = set(tokens)
-            return {"lang": lang, "words": words}
-
-        # First collect all words and languages
+        # Process sentences using configured parallelism
         logging.info("Processing sentences...")
-        processed = train_df.swifter.apply(process_sentence, axis=1)
-        # Ensure we have a DataFrame with ['lang', 'words'] columns
-        if isinstance(processed, pd.Series):
-            processed = pd.DataFrame(processed.tolist())
+        processed = self._process_sentences(train_df, workers=token_workers)
 
         # Then update the dictionaries safely
         logging.info("Building language dictionaries...")
@@ -556,6 +585,60 @@ class Vocabulous:
 
         df = df[df["scores"].apply(_get_top_score_diff) > confidence_margin]
         return df
+
+    def _clean_series(self, series: pd.Series, workers=None) -> pd.Series:
+        """Clean a pandas Series of texts, optionally in parallel."""
+        if series.empty:
+            return series
+        if not workers or workers <= 1:
+            return series.swifter.apply(lambda x: self._clean_text(x))
+
+        splits = _split_indices(len(series), workers)
+        if not splits:
+            return series
+
+        values = series.tolist()
+        ctx = mp.get_context("spawn")
+        tasks = [
+            (split.tolist(), [values[i] for i in split], self.default_script)
+            for split in splits
+        ]
+
+        cleaned = [None] * len(series)
+        with ctx.Pool(processes=len(tasks)) as pool:
+            for positions, chunk_cleaned in pool.map(_clean_texts_chunk, tasks):
+                for pos, value in zip(positions, chunk_cleaned):
+                    cleaned[pos] = value
+
+        return pd.Series(cleaned, index=series.index, name=series.name)
+
+    def _process_sentences(self, df: pd.DataFrame, workers=None) -> pd.DataFrame:
+        """Extract lang/word sets per sentence, optionally in parallel."""
+        if df.empty:
+            return pd.DataFrame(columns=["lang", "words"])
+        if not workers or workers <= 1:
+            processed = df.swifter.apply(
+                lambda row: _sentence_record(row["lang"], row["text"]), axis=1
+            )
+            if isinstance(processed, pd.Series):
+                processed = pd.DataFrame(processed.tolist())
+            return processed
+
+        splits = _split_indices(len(df), workers)
+        langs = df["lang"].tolist()
+        texts = df["text"].tolist()
+        ctx = mp.get_context("spawn")
+        tasks = [
+            ([langs[i] for i in split], [texts[i] for i in split])
+            for split in splits
+        ]
+
+        rows = []
+        with ctx.Pool(processes=len(tasks)) as pool:
+            for chunk in pool.map(_process_sentence_chunk, tasks):
+                rows.extend(chunk)
+
+        return pd.DataFrame(rows, columns=["lang", "words"])
 
     def _deduplicate(self, df):
         """Deduplicate the training data by removing duplicate sentences."""

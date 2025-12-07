@@ -218,13 +218,57 @@ def bench_large_n_compare(n=200000, sentence_len=20, dict_size=500):
         (f" | numba: {tn:.3f}s ({n/tn:.1f} rows/s)" if tn != float('inf') else "") +
         (f" | sparse: {ts:.3f}s ({n/ts:.1f} rows/s)" if ts != float('inf') else "")
     )
-    print(f"n={n} dict={dict_size} len={sentence_len} | apply: {ta:.3f}s ({n/ta:.1f} rows/s) | vectorized-batched: {tv:.3f}s ({n/tv:.1f} rows/s){extra}")
+    print(
+        f"n={n} dict={dict_size} len={sentence_len} | apply: {ta:.3f}s ({n/ta:.1f} rows/s) | vectorized-batched: {tv:.3f}s ({n/tv:.1f} rows/s){extra}"
+    )
+
+
+def bench_parallel_clean_token(n_rows=50000, worker_options=(1, 4, 8)):
+    print("\n== Benchmark: cleaning/tokenization parallelism ==")
+    df = synth_dataset(n_rows=n_rows)
+    model = Vocabulous()
+    series = df["text"]
+
+    def run_clean(w):
+        model._clean_series(series, workers=w)
+
+    def run_token(w):
+        model._process_sentences(df, workers=w)
+
+    for workers in worker_options:
+        tc = time_fn(run_clean, workers)
+        tt = time_fn(run_token, workers)
+        print(
+            f"workers={workers:2d} | clean: {tc:.3f}s ({n_rows/tc:.1f} rows/s) | token: {tt:.3f}s ({n_rows/tt:.1f} rows/s)"
+        )
+
+
+def bench_train_workers(n_rows=20000, worker_pairs=((1, 1), (2, 2), (4, 4))):
+    print("\n== Benchmark: train() with worker settings ==")
+    df = synth_dataset(n_rows=n_rows)
+    for clean_workers, token_workers in worker_pairs:
+        model = Vocabulous()
+        t = time_fn(
+            model.train,
+            df.copy(),
+            df.copy(),
+            1,
+            0.2,
+            0.2,
+            "text",
+            "lang",
+            clean_workers,
+            token_workers,
+        )
+        print(
+            f"clean={clean_workers:2d} token={token_workers:2d} | train: {t:.3f}s ({n_rows/t:.1f} sentences/s)"
+        )
 
 
 def main():
     # Single-size baseline
     df = synth_dataset(n_rows=20000)
-    model = build_model()
+    model = Vocabulous()
 
     # Benchmark cleaning + scoring (auto mode)
     t_score = time_fn(model._score, df.copy(), already_clean=False)
@@ -246,6 +290,8 @@ def main():
     bench_large_n(n=100000)
     bench_high_match(n_rows=20000, sentence_len=20, vocab_sizes=(50,500,5000))
     bench_large_n_compare(n=200000, sentence_len=20, dict_size=1000)
+    bench_parallel_clean_token()
+    bench_train_workers()
 
 
 if __name__ == "__main__":

@@ -1,3 +1,10 @@
+## [0.1.2] - 2025-12-07
+
+### Added
+- Multiprocessing hooks for training via `clean_workers` and `token_workers`, plus benchmarking harness `benchmarks/train_parallel_compare.py` with deterministic synthetic dataset.
+- Markdown benchmark report documenting sequential vs parallel results (`benchmarks/parallel_training_report.md`).
+- README updates describing parallel training options, reproduction commands, and 3.26× speedup highlight.
+
 ## [0.1.1] - 2025-11-05
 
 ### Added

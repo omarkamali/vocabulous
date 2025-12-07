@@ -58,13 +58,15 @@ eval_data = [
     {'text': 'Buenos días', 'lang': 'es'},
 ]
 
-# Train the model
+# Train the model (enable parallel cleaning/tokenization when working at scale)
 model, report = model.train(
     train_data=train_data,
     eval_data=eval_data,
     cycles=3,
     base_confidence=0.5,
-    confidence_margin=0.3
+    confidence_margin=0.3,
+    clean_workers=4,  # optional multiprocessing for text cleaning
+    token_workers=4,  # optional multiprocessing for sentence tokenization
 )
 
 # Use for language detection
@@ -262,6 +264,15 @@ model, _ = model.train(data, eval_data, cycles=1)
 
 # Lower confidence margin for less aggressive filtering
 model, _ = model.train(data, eval_data, confidence_margin=0.1)
+
+# Enable multiprocessing for cleaning/tokenization on large corpora
+model, _ = model.train(
+    data,
+    eval_data,
+    cycles=1,
+    clean_workers=4,
+    token_workers=4,
+)
 ```
 
 ### Quality Optimization
@@ -279,6 +290,7 @@ model, _ = model.train(data, eval_data, base_confidence=0.7)
 ## Benchmarks
 
 - **Full results**: See [benchmark.md](./benchmarks/benchmark.md) for the complete output and methodology.
+- **Parallel training report**: [parallel_training_report.md](./benchmarks/parallel_training_report.md) documents sequential vs multiprocessing runs using `clean_workers`/`token_workers`.
 - **Highlights**:
   - 20k rows clean+score: ~454k rows/s
   - Apply vs Vectorized: ~450–500k rows/s on 5k–50k rows
@@ -286,11 +298,13 @@ model, _ = model.train(data, eval_data, base_confidence=0.7)
   - Dictionary size (50→5000 per language): near ~450–480k rows/s
   - Large-n vectorized batched (100k): ~403k rows/s
   - Large-n compare (200k, dict=1000, len=20): ~224k–225k rows/s across modes
+  - **Parallel training (200k synthetic sentences with 10k word vocabulary)**: Sequential 393 s vs parallel (4×4 workers) 120 s → **3.26× speedup** with identical dictionaries/predictions.
 
 Run locally with uv:
 
 ```bash
 uv run python benchmarks/benchmark_vocabulous.py | tee benchmarks/benchmark_output.txt
+uv run python benchmarks/train_parallel_compare.py --rows 200000 --clean-workers 4 --token-workers 4
 ```
 
 ## Classification Performance
