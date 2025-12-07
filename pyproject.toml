@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
 authors = [
-    {name = "Omar Kamali", email = "unscript@omarkama.li"},
+    {name = "Omar Kamali", email = "vocabulous@omarkama.li"},
 ]
 keywords = [
     "language-detection", 
