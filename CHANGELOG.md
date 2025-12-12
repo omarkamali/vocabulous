@@ -1,3 +1,14 @@
+## [0.1.3] - 2025-12-12
+
+### Added
+- **`num_proc` parameter** on `train()`: a single knob that drives all parallel stages (sentence expansion, cleaning, tokenization). Individual stage workers can still be overridden.
+- Chunked + parallel sentence expansion with configurable `_sentence_chunk_size`, `sentence_workers`, tqdm progress, and `benchmarks/run_sentence_expansion.py` runner.
+- README + `parallel_training_report.md` updates documenting the sentence-expansion benchmark methodology (5M rows, chunk size 10k, workers 1–16) and reproduction commands.
+
+### Changed
+- Default benchmarks now cover cleaning/tokenization and sentence expansion stages; report clarifies how to tune chunk size for better scaling.
+- README examples updated to use `num_proc` for simpler parallel training.
+
 ## [0.1.2] - 2025-12-07
 
 ### Added

@@ -42,3 +42,29 @@ uv run python benchmarks/train_parallel_compare.py \
 ```
 
 Adjust `--rows`, `--clean-workers`, and `--token-workers` to explore scaling characteristics. The script exits with a non-zero code if dictionaries or predictions diverge between sequential and parallel runs.
+
+## Sentence Expansion Benchmark
+
+To evaluate the newly parallelized sentence-expansion stage (which splits each sample into sentences before cleaning), we ran:
+
+```bash
+uv run python benchmarks/run_sentence_expansion.py \
+  --rows 5000000 \
+  --chunk-size 10000 \
+  --workers 1 2 4 8 16
+```
+
+Settings:
+
+- `_sentence_chunk_size` set via `--chunk-size 10_000` (yielding 500 chunks for 5M rows).
+- Workers varied among `{1,2,4,8,16}` with `spawn` context.
+
+| workers | time (s) | throughput (rows/s) |
+|---------|---------:|--------------------:|
+| 1       | 10.22    | 0.49 M              |
+| 2       | 11.37    | 0.44 M              |
+| 4       | 9.00     | 0.56 M              |
+| 8       | 8.68     | 0.58 M              |
+| 16      | 9.02     | 0.55 M              |
+
+Because expansion now operates chunk-by-chunk, throughput improves once there are enough chunks to keep workers saturated (≥500 here). On even larger datasets (or with smaller chunk sizes), we expect more pronounced gains.

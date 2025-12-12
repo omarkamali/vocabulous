@@ -265,6 +265,22 @@ def bench_train_workers(n_rows=20000, worker_pairs=((1, 1), (2, 2), (4, 4))):
         )
 
 
+def bench_sentence_expansion(
+    n_rows=200000, worker_options=(1, 2, 4, 8), chunk_size=100_000
+):
+    print("\n== Benchmark: sentence expansion parallelism ==")
+    df = synth_dataset(n_rows=n_rows)
+    model = Vocabulous()
+    model._sentence_chunk_size = chunk_size
+
+    def run(w):
+        model._expand_to_sentence_level(df, workers=w)
+
+    for workers in worker_options:
+        t = time_fn(run, workers)
+        print(f"workers={workers:2d} | expand: {t:.3f}s ({n_rows/t:.1f} rows/s)")
+
+
 def main():
     # Single-size baseline
     df = synth_dataset(n_rows=20000)
@@ -292,6 +308,7 @@ def main():
     bench_large_n_compare(n=200000, sentence_len=20, dict_size=1000)
     bench_parallel_clean_token()
     bench_train_workers()
+    bench_sentence_expansion()
 
 
 if __name__ == "__main__":

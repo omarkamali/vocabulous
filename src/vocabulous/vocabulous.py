@@ -85,6 +85,13 @@ def _clean_text_cached(default_script, text):
     return cleaned
 
 
+def _chunk_indices(length, chunk_size):
+    if length == 0:
+        return []
+    size = max(1, int(chunk_size))
+    return [np.arange(start, min(start + size, length)) for start in range(0, length, size)]
+
+
 def _split_indices(length, parts):
     """Return ordered list of index batches covering range(length)."""
     if length == 0:
@@ -112,6 +119,82 @@ def _process_sentence_chunk(payload):
     """Worker chunk for extracting lang/word sets."""
     langs, texts = payload
     return [_sentence_record(lang, text) for lang, text in zip(langs, texts)]
+
+
+def _split_text_into_sentences(text):
+    if not text or not str(text).strip():
+        return []
+    try:
+        return nltk.sent_tokenize(text)
+    except Exception:
+        return [text]
+
+
+def _expand_sentences_chunk(payload):
+    records, text_column = payload
+    expanded = []
+    for row in records:
+        sentences = _split_text_into_sentences(row.get(text_column, ""))
+        for sentence in sentences:
+            if not sentence or not str(sentence).strip():
+                continue
+            new_row = row.copy()
+            new_row[text_column] = sentence
+            expanded.append(new_row)
+    return expanded
+
+
+@lru_cache(maxsize=500_000)
+def _tokenize_cached(sentence):
+    """Module-level cached tokenizer for scoring."""
+    if not sentence or not str(sentence).strip():
+        return tuple()
+    return tuple(re.findall(r"\w+", str(sentence), flags=re.UNICODE))
+
+
+def _score_sentences_chunk(payload):
+    """Worker chunk for scoring sentences.
+    
+    payload: (positions, texts, word_lang_freq, languages)
+    Returns: list of (position, scores_dict)
+    """
+    positions, texts, word_lang_freq, languages = payload
+    results = []
+    for pos, text in zip(positions, texts):
+        tokens = _tokenize_cached(text)
+        if not tokens:
+            results.append((pos, {}))
+            continue
+        scores = {}
+        for word in tokens:
+            for lang in word_lang_freq.get(word, {}).keys():
+                if lang in languages:
+                    scores[lang] = scores.get(lang, 0) + 1
+        total = len(tokens)
+        for lang in scores:
+            scores[lang] /= total
+        results.append((pos, scores))
+    return results
+
+
+def _accumulate_dict_chunk(payload):
+    """Worker chunk for dictionary accumulation.
+    
+    payload: (langs_list, words_list)
+    Returns: (partial_word_lang_freq, partial_languages)
+    """
+    langs_list, words_list = payload
+    partial_freq = {}
+    partial_langs = set()
+    for lang, words in zip(langs_list, words_list):
+        partial_langs.add(lang)
+        for word in words:
+            if word not in partial_freq:
+                partial_freq[word] = {}
+            if lang not in partial_freq[word]:
+                partial_freq[word][lang] = 0
+            partial_freq[word][lang] += 1
+    return partial_freq, partial_langs
 
 
 class Vocabulous:
@@ -150,57 +233,66 @@ class Vocabulous:
         self._sparse_workers = 0  # 0 means no parallelism; >0 uses ThreadPool
         self._sparse_store = None  # path to store/load shards
         self._sparse_backend = "memory"  # or "memmap"
+        # Sentence expansion configuration
+        self._sentence_chunk_size = 100_000
         # Aggregated stats (computed on demand)
         self._lang_token_totals = None  # {lang: total_tokens}
         # Aggregated stats (computed on demand)
         self._lang_token_totals = None  # {lang: total_tokens}
 
     def _split_into_sentences(self, text):
-        """Split text into sentences using NLTK sentence tokenizer.
+        """Split text into sentences using NLTK sentence tokenizer."""
+        return _split_text_into_sentences(text)
 
-        Args:
-            text (str): Input text to split
+    def _expand_to_sentence_level(self, df, text_column="text", lang_column="lang", workers=None):
+        """Expand dataframe from sample level to sentence level with chunked parallelization."""
+        if df.empty:
+            return df
 
-        Returns:
-            List[str]: List of sentences
-        """
-        if not text or not text.strip():
-            return []
+        df = df.reset_index(drop=True)
+        chunk_indices = _chunk_indices(len(df), self._sentence_chunk_size)
+        logging.info(
+            "Expanding data from sample level to sentence level (chunks=%d, workers=%s)...",
+            len(chunk_indices),
+            workers or 1,
+        )
 
-        try:
-            sentences = nltk.sent_tokenize(text)
-            # Do not filter by word count; keep short sentences for downstream logic/tests
-            return sentences
-        except Exception as e:
-            logging.warning(f"Error tokenizing sentences: {e}")
-            return [text]  # Fallback to original text
+        expanded_chunks = []
+        desc = "Sentence expansion"
+        if workers and workers > 1:
+            ctx = mp.get_context("spawn")
+            task_data = [
+                (df.iloc[idxs].to_dict("records"), text_column)
+                for idxs in chunk_indices
+            ]
+            max_proc = min(workers, len(task_data))
+            with ctx.Pool(processes=max_proc) as pool:
+                for chunk in tqdm(
+                    pool.imap(_expand_sentences_chunk, task_data),
+                    total=len(task_data),
+                    desc=desc,
+                    unit="chunk",
+                ):
+                    if chunk:
+                        expanded_chunks.append(pd.DataFrame(chunk, columns=df.columns))
+        else:
+            for idxs in tqdm(chunk_indices, desc=desc, unit="chunk"):
+                chunk = df.iloc[idxs].copy()
+                chunk[text_column] = chunk[text_column].apply(self._split_into_sentences)
+                chunk = chunk.explode(text_column, ignore_index=True)
+                chunk = chunk.dropna(subset=[text_column])
+                chunk = chunk[chunk[text_column] != ""]
+                expanded_chunks.append(chunk)
 
-    def _expand_to_sentence_level(self, df, text_column="text", lang_column="lang"):
-        """Expand dataframe from sample level to sentence level.
+        if not expanded_chunks:
+            return df.iloc[0:0].copy()
 
-        Args:
-            df (pd.DataFrame): Input dataframe with samples
-            text_column (str): Name of text column
-            lang_column (str): Name of language column
-
-        Returns:
-            pd.DataFrame: Expanded dataframe with one row per sentence
-        """
-        logging.info("Expanding data from sample level to sentence level...")
-
-        # Vectorized expansion using pandas explode to avoid Python-level row loops
-        tmp_col = "__sentences__"
-        df = df.copy()
-        df[tmp_col] = df[text_column].apply(self._split_into_sentences)
-        expanded_df = df.explode(tmp_col, ignore_index=True)
-        # Move exploded sentences back into the original text column
-        expanded_df[text_column] = expanded_df[tmp_col]
-        expanded_df = expanded_df.drop(columns=[tmp_col])
-        # Drop any rows where sentence splitting yielded None/empty
-        expanded_df = expanded_df[expanded_df[text_column].notna()]
-        expanded_df = expanded_df[expanded_df[text_column] != ""]
-        logging.info(f"Expanded from {len(df)} samples to {len(expanded_df)} sentences")
-
+        expanded_df = pd.concat(expanded_chunks, ignore_index=True)
+        logging.info(
+            "Expanded from %d samples to %d sentences",
+            len(df),
+            len(expanded_df),
+        )
         return expanded_df
 
     def train(
@@ -212,8 +304,12 @@ class Vocabulous:
         confidence_margin=0.5,
         text_column="text",
         lang_column="lang",
+        num_proc=1,
         clean_workers=None,
         token_workers=None,
+        sentence_workers=None,
+        score_workers=None,
+        accumulate_workers=None,
     ):
         """Build language dictionaries from training data.
 
@@ -223,13 +319,43 @@ class Vocabulous:
             cycles (int): Number of dictionary refinement cycles
             base_confidence (float): Minimum confidence threshold for word-language associations
             confidence_margin (float): Minimum margin between top two language scores (0-1)
-            clean_workers (Optional[int]): Processes for cleaning text. Default sequential.
-            token_workers (Optional[int]): Processes for tokenizing sentences. Default sequential.
+            num_proc (int): Number of parallel workers for all stages (default 1 = sequential).
+                Individual stage workers can be overridden via the specific *_workers parameters.
+            clean_workers (Optional[int]): Processes for cleaning text. Defaults to num_proc.
+            token_workers (Optional[int]): Processes for tokenizing sentences. Defaults to num_proc.
+            sentence_workers (Optional[int]): Processes for sentence expansion. Defaults to num_proc.
+            score_workers (Optional[int]): Processes for scoring. Defaults to 1 (parallel scoring has overhead).
+            accumulate_workers (Optional[int]): Processes for dictionary accumulation. Defaults to num_proc.
 
         Returns:
             Tuple[Vocabulous, Dict]: Updated model and training report
         """
         logging.info("Starting Vocabulous training process...")
+
+        # Derive per-stage workers from num_proc unless explicitly overridden
+        if sentence_workers is None:
+            sentence_workers = num_proc
+        if clean_workers is None:
+            clean_workers = num_proc
+        if token_workers is None:
+            token_workers = num_proc
+        if accumulate_workers is None:
+            accumulate_workers = num_proc
+        # Note: score_workers defaults to 1 (not num_proc) because scoring is too fast
+        # to benefit from multiprocessing - the overhead of serializing word_lang_freq
+        # and spawning processes outweighs any parallelism gains.
+        if score_workers is None:
+            score_workers = 1
+
+        if num_proc > 1 or any(w > 1 for w in (sentence_workers, clean_workers, token_workers, accumulate_workers)):
+            logging.info(
+                "Parallel config: num_proc=%d → sentence=%d, clean=%d, token=%d, accumulate=%d",
+                num_proc,
+                sentence_workers,
+                clean_workers,
+                token_workers,
+                accumulate_workers,
+            )
 
         # Normalize inputs: support dict form {lang: [sentences]} or DataFrame with columns
         if eval_df is None:
@@ -278,9 +404,13 @@ class Vocabulous:
 
         # Expand to sentence level
         logging.info("Expanding training data to sentence level...")
-        train_df = self._expand_to_sentence_level(train_df, text_column, lang_column)
+        train_df = self._expand_to_sentence_level(
+            train_df, text_column, lang_column, workers=sentence_workers
+        )
         logging.info("Expanding evaluation data to sentence level...")
-        eval_df = self._expand_to_sentence_level(eval_df, text_column, lang_column)
+        eval_df = self._expand_to_sentence_level(
+            eval_df, text_column, lang_column, workers=sentence_workers
+        )
 
         # Clean text before training
         logging.info("Cleaning text in training data...")
@@ -314,6 +444,8 @@ class Vocabulous:
                     base_confidence,
                     confidence_margin,
                     token_workers=token_workers,
+                    score_workers=score_workers,
+                    accumulate_workers=accumulate_workers,
                 )
             else:
                 # Skip cleaning on final cycle
@@ -324,6 +456,8 @@ class Vocabulous:
                     confidence_margin,
                     skip_cleaning=True,
                     token_workers=token_workers,
+                    score_workers=score_workers,
+                    accumulate_workers=accumulate_workers,
                 )
 
             cycle_reports.append(report)
@@ -364,6 +498,8 @@ class Vocabulous:
         confidence_margin=0.5,
         skip_cleaning=False,
         token_workers=None,
+        score_workers=None,
+        accumulate_workers=None,
     ):
         # first let's deduplicate the training data at sentence level
         logging.info(f"Deduplicating training sentences for current cycle...")
@@ -381,29 +517,18 @@ class Vocabulous:
         logging.info("Processing sentences...")
         processed = self._process_sentences(train_df, workers=token_workers)
 
-        # Then update the dictionaries safely
+        # Then update the dictionaries (parallel or sequential)
         logging.info("Building language dictionaries...")
-        # processed is a DataFrame with columns ['lang', 'words']
-        for _, result in tqdm(processed.iterrows(), total=len(processed)):
-            lang = result["lang"]
-            words = result["words"]
-            self.languages.add(lang)
-
-            for word in words:
-                if word not in self.word_lang_freq:
-                    self.word_lang_freq[word] = {}
-                if lang not in self.word_lang_freq[word]:
-                    self.word_lang_freq[word][lang] = 0
-                self.word_lang_freq[word][lang] += 1
+        self._accumulate_dict(processed, workers=accumulate_workers)
 
         # now we have a dictionary of unique words for each language, let's produce a report
         logging.info("Generating cycle report...")
-        report = self._report_cycle(eval_df)
+        report = self._report_cycle(eval_df, score_workers=score_workers)
 
         # now let's use it to filter the training data where the ground truth lang conflicts with the language classification using the dictionaries
         logging.info("Scoring training sentences...")
         # Training data was cleaned earlier in train(), so skip re-cleaning
-        train_df = self._score(train_df, already_clean=True)
+        train_df = self._score(train_df, already_clean=True, workers=score_workers)
 
         # Skip cleaning if this is the final cycle
         if not skip_cleaning:
@@ -427,10 +552,10 @@ class Vocabulous:
         """Clean text using Unscript with LRU caching keyed by (default_script, text)."""
         return _clean_text_cached(self.default_script, text)
 
-    def _report_cycle(self, eval_df):
+    def _report_cycle(self, eval_df, score_workers=None):
         """Produce a report for the cycle"""
         # Score the evaluation data
-        scored_df = self._score(eval_df)
+        scored_df = self._score(eval_df, workers=score_workers)
         # Use precomputed predicted if present (from _score), otherwise derive it
         if "predicted_lang" not in scored_df.columns or scored_df["predicted_lang"].isna().any():
             def get_max_lang(scores):
@@ -640,6 +765,77 @@ class Vocabulous:
 
         return pd.DataFrame(rows, columns=["lang", "words"])
 
+    def _score_series_parallel(self, series: pd.Series, workers: int) -> pd.Series:
+        """Score a pandas Series of texts in parallel using multiprocessing."""
+        if series.empty:
+            return pd.Series([], dtype="object")
+
+        splits = _split_indices(len(series), workers)
+        if not splits:
+            return series.apply(self._score_sentence)
+
+        values = series.tolist()
+        ctx = mp.get_context("spawn")
+        tasks = [
+            (split.tolist(), [values[i] for i in split], self.word_lang_freq, self.languages)
+            for split in splits
+        ]
+
+        scores = [None] * len(series)
+        with ctx.Pool(processes=len(tasks)) as pool:
+            for chunk_results in pool.map(_score_sentences_chunk, tasks):
+                for pos, score_dict in chunk_results:
+                    scores[pos] = score_dict
+
+        return pd.Series(scores, index=series.index, name=series.name)
+
+    def _accumulate_dict(self, processed: pd.DataFrame, workers=None):
+        """Accumulate word-language frequencies from processed sentences.
+        
+        Args:
+            processed: DataFrame with columns ['lang', 'words']
+            workers: Number of parallel workers. Default None = sequential.
+        """
+        if processed.empty:
+            return
+        
+        if not workers or workers <= 1:
+            # Sequential accumulation
+            for _, result in tqdm(processed.iterrows(), total=len(processed)):
+                lang = result["lang"]
+                words = result["words"]
+                self.languages.add(lang)
+                for word in words:
+                    if word not in self.word_lang_freq:
+                        self.word_lang_freq[word] = {}
+                    if lang not in self.word_lang_freq[word]:
+                        self.word_lang_freq[word][lang] = 0
+                    self.word_lang_freq[word][lang] += 1
+            return
+        
+        # Parallel accumulation with map-reduce
+        splits = _split_indices(len(processed), workers)
+        langs = processed["lang"].tolist()
+        words = processed["words"].tolist()
+        
+        ctx = mp.get_context("spawn")
+        tasks = [
+            ([langs[i] for i in split], [words[i] for i in split])
+            for split in splits
+        ]
+        
+        with ctx.Pool(processes=len(tasks)) as pool:
+            partials = pool.map(_accumulate_dict_chunk, tasks)
+        
+        # Merge partial results on main thread
+        for partial_freq, partial_langs in partials:
+            self.languages.update(partial_langs)
+            for word, lang_counts in partial_freq.items():
+                if word not in self.word_lang_freq:
+                    self.word_lang_freq[word] = {}
+                for lang, count in lang_counts.items():
+                    self.word_lang_freq[word][lang] = self.word_lang_freq[word].get(lang, 0) + count
+
     def _deduplicate(self, df):
         """Deduplicate the training data by removing duplicate sentences."""
         logging.info("Deduplicating training data...")
@@ -649,9 +845,14 @@ class Vocabulous:
         )
         return deduplicated_df
 
-    def _score(self, df, already_clean=False):
+    def _score(self, df, already_clean=False, workers=None):
         """Score the provided dataframe by matching words in sentences with language dictionaries
         and then calculate the confidence scores. Adds precomputed top-2 columns.
+        
+        Args:
+            df: DataFrame with 'text' column
+            already_clean: If True, skip text cleaning
+            workers: Number of parallel workers for scoring. Default None = sequential.
         """
         if not already_clean:
             logging.info("Cleaning text before scoring...")
@@ -660,9 +861,13 @@ class Vocabulous:
             df = df[df["text"] != ""]
 
         df = df.copy()
-        # Apply-only scoring path
-        logging.info("Scoring sentences (apply swifter)...")
-        df["scores"] = df["text"].swifter.apply(self._score_sentence)
+        # Parallel or sequential scoring
+        if workers and workers > 1:
+            logging.info("Scoring sentences (parallel, workers=%d)...", workers)
+            df["scores"] = self._score_series_parallel(df["text"], workers)
+        else:
+            logging.info("Scoring sentences (apply swifter)...")
+            df["scores"] = df["text"].swifter.apply(self._score_sentence)
 
         # Precompute top-1 and top-2 info to speed up downstream steps
         def _top2(scores):
@@ -1296,10 +1501,3 @@ class Vocabulous:
         ]
 
         return confident_df
-
-
-@lru_cache(maxsize=200_000)
-def _tokenize_cached(text: str) -> tuple:
-    if not text:
-        return tuple()
-    return tuple(re.findall(r"\w+", text, flags=re.UNICODE))

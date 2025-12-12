@@ -58,15 +58,14 @@ eval_data = [
     {'text': 'Buenos días', 'lang': 'es'},
 ]
 
-# Train the model (enable parallel cleaning/tokenization when working at scale)
+# Train the model (enable parallel processing when working at scale)
 model, report = model.train(
     train_data=train_data,
     eval_data=eval_data,
     cycles=3,
     base_confidence=0.5,
     confidence_margin=0.3,
-    clean_workers=4,  # optional multiprocessing for text cleaning
-    token_workers=4,  # optional multiprocessing for sentence tokenization
+    num_proc=4,  # use 4 workers for all stages (sentence expansion, cleaning, tokenization)
 )
 
 # Use for language detection
@@ -265,13 +264,21 @@ model, _ = model.train(data, eval_data, cycles=1)
 # Lower confidence margin for less aggressive filtering
 model, _ = model.train(data, eval_data, confidence_margin=0.1)
 
-# Enable multiprocessing for cleaning/tokenization on large corpora
+# Enable multiprocessing for all stages on large corpora
 model, _ = model.train(
     data,
     eval_data,
     cycles=1,
-    clean_workers=4,
-    token_workers=4,
+    num_proc=4,  # drives sentence_workers, clean_workers, token_workers
+)
+
+# Override a specific stage if needed
+model, _ = model.train(
+    data,
+    eval_data,
+    cycles=1,
+    num_proc=4,
+    clean_workers=8,  # use 8 workers for cleaning, 4 for other stages
 )
 ```
 
@@ -299,12 +306,24 @@ model, _ = model.train(data, eval_data, base_confidence=0.7)
   - Large-n vectorized batched (100k): ~403k rows/s
   - Large-n compare (200k, dict=1000, len=20): ~224k–225k rows/s across modes
   - **Parallel training (200k synthetic sentences with 10k word vocabulary)**: Sequential 393 s vs parallel (4×4 workers) 120 s → **3.26× speedup** with identical dictionaries/predictions.
+  - **Sentence expansion (5 M rows, chunk size 10 k)**:
+
+    | workers | time (s) | throughput (rows/s) |
+    |---------|---------:|--------------------:|
+    | 1       | 10.22    | 0.49 M              |
+    | 2       | 11.37    | 0.44 M              |
+    | 4       | 9.00     | 0.56 M              |
+    | 8       | 8.68     | 0.58 M              |
+    | 16      | 9.02     | 0.55 M              |
+
+    Larger worker counts start to help once there are many chunks (>500 here); we recommend profiling with `--chunk-size` tuned to keep workers busy.
 
 Run locally with uv:
 
 ```bash
 uv run python benchmarks/benchmark_vocabulous.py | tee benchmarks/benchmark_output.txt
 uv run python benchmarks/train_parallel_compare.py --rows 200000 --clean-workers 4 --token-workers 4
+uv run python benchmarks/run_sentence_expansion.py --rows 5000000 --chunk-size 10000 --workers 1 2 4 8 16
 ```
 
 ## Classification Performance
